@@ -141,6 +141,7 @@ class Pool(bootsteps.StartStopComponent):
                 pass
 
         pool.init_callbacks(
+            hub=hub,
             on_process_up=lambda w: add_reader(w.sentinel, maintain_pool),
             on_process_down=lambda w: remove(w.sentinel),
             on_timeout_set=on_timeout_set,
@@ -313,6 +314,7 @@ class WorkController(configurated):
 
     _state = None
     _running = 0
+    pool = None
 
     def __init__(self, loglevel=None, hostname=None, ready_callback=noop,
                  queues=None, app=None, pidfile=None, use_eventloop=None,

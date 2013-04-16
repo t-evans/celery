@@ -8,6 +8,8 @@
 """
 from __future__ import absolute_import
 
+from functools import wraps
+
 from kombu.utils import cached_property
 from kombu.utils import eventio
 
@@ -60,13 +62,18 @@ class BoundedSemaphore(object):
         :param \*partial_args: partial arguments to callback.
 
         """
-        if self.value <= 0:
-            self._waiting.append((callback, partial_args))
-            return False
-        else:
-            self.value = max(self.value - 1, 0)
-            callback(*partial_args)
-            return True
+        print('+PUTLOCK ACQUIRE')
+        try:
+            if self.value <= 0:
+                self._waiting.append((callback, partial_args))
+                return False
+            else:
+                self.value = max(self.value - 1, 0)
+                print('CALLING %r' % (callback, ))
+                callback(*partial_args)
+                return True
+        finally:
+            print('-PUTLOCK ACQUIRE')
 
     def release(self):
         """Release semaphore.
@@ -75,10 +82,14 @@ class BoundedSemaphore(object):
         calls to :meth:`acquire` done when the semaphore was busy.
 
         """
-        self.value = min(self.value + 1, self.initial_value)
-        if self._waiting:
-            waiter, args = self._waiting.pop()
-            waiter(*args)
+        print('+PUTLOCK RELEASE')
+        try:
+            self.value = min(self.value + 1, self.initial_value)
+            if self._waiting:
+                waiter, args = self._waiting.pop()
+                waiter(*args)
+        finally:
+            print('-PUTLOCK RELEASE')
 
     def grow(self, n=1):
         """Change the size of the semaphore to hold more values."""
@@ -162,13 +173,44 @@ class Hub(object):
         return min(max(delay or 0, min_delay), max_delay)
 
     def add(self, fd, callback, flags):
-        self.poller.register(fd, flags)
+        try:
+            self.poller.register(fd, flags)
+        except ValueError:
+            self._discard(fd)
+        else:
+            if not isinstance(fd, int):
+                fd = fd.fileno()
+            if flags & READ:
+                self.readers[fd] = callback
+            if flags & WRITE:
+                self.writers[fd] = callback
+
+    def remove(self, fd):
+        self.poller.unregister(fd)
+        self._discard(fd)
+
+    def _discard(self, fd):
         if not isinstance(fd, int):
             fd = fd.fileno()
-        if flags & READ:
-            self.readers[fd] = callback
-        if flags & WRITE:
-            self.writers[fd] = callback
+        self.readers.pop(fd, None)
+        self.writers.pop(fd, None)
+
+    def when_readable(self, fd, callback, args=(), kwargs={}):
+        return self._listener(self.add_reader, fd, callback, args, kwargs)
+
+    def when_writeable(self, fd, callback, args=(), kwargs={}):
+        return self._listener(self.add_writer, fd, callback, args, kwargs)
+
+    def _listener(self, method, fd, callback, args=(), kwargs={}):
+
+        @wraps(callback)
+        def listener(fileno, event):
+            try:
+                callback(*args, **kwargs)
+            finally:
+                self.remove(fd)
+
+        method(fd, listener)
 
     def add_reader(self, fd, callback):
         return self.add(fd, callback, READ | ERR)

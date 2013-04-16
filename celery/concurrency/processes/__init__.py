@@ -11,10 +11,14 @@
 """
 from __future__ import absolute_import
 
+import errno
 import os
+import signal
+import socket
 
 from billiard import forking_enable
-from billiard.pool import Pool, RUN, CLOSE
+from billiard.pool import Pool, RUN, CLOSE, SIGLOST
+from kombu.utils.compat import get_errno
 
 from celery import platforms
 from celery import signals
@@ -31,6 +35,10 @@ WORKER_SIGRESET = frozenset(['SIGTERM',
 
 #: List of signals to ignore when a child process starts.
 WORKER_SIGIGNORE = frozenset(['SIGINT'])
+
+
+def ignore_signal(signum, frame):
+    pass
 
 
 def process_initializer(app, hostname):
@@ -83,6 +91,11 @@ class TaskPool(BasePool):
         self.on_hard_timeout = P._timeout_handler.on_hard_timeout
         self.maintain_pool = P.maintain_pool
         self.maybe_handle_result = P._result_handler.handle_event
+        if SIGLOST:
+            try:
+                signal.signal(SIGLOST, ignore_signal)
+            except (OSError, ValueError, RuntimeError):
+                pass
 
     def did_start_ok(self):
         return self._pool.did_start_ok()
@@ -123,7 +136,28 @@ class TaskPool(BasePool):
                 'put-guarded-by-semaphore': self.putlocks,
                 'timeouts': (self._pool.soft_timeout, self._pool.timeout)}
 
-    def init_callbacks(self, **kwargs):
+    def init_callbacks(self, hub, **kwargs):
+        _quick_put = self._pool._quick_put
+        _writer = self._pool._inqueue._writer
+
+        def qqq(*args, **kwargs):
+            try:
+                print('+PUT QUICKPUT')
+                try:
+                    _quick_put(*args, **kwargs)
+                finally:
+                    print('-PUT QUICKPUT')
+            except socket.timeout:
+                print('SOCKET TIMED OUT')
+                return inqueue_put(*args, **kwargs)
+            except BaseException, exc:
+                print('GOT BASE EXCEPTION')
+
+        def inqueue_put(*args, **kwargs):
+            hub.when_writeable(_writer.fileno(), qqq, args, kwargs)
+
+        self._pool._quick_put = inqueue_put
+
         for k, v in kwargs.iteritems():
             setattr(self._pool, k, v)
 
