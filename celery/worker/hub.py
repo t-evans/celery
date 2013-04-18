@@ -126,27 +126,17 @@ class trampoline(object):
 
     def __call__(self, fd=None, event=None):
         try:
-            next(self.it)
+            val = next(self.it)
         except StopIteration:
             self.hub.remove(self.fd)
             self.ready = True
-            try:
-                waiter = self.hub._waiters[fileno(self.fd)].popleft()
-            except IndexError:
-                pass
-            else:
-                self.hub.add(*waiter)
         except BaseException:
             self.hub.remove(self.fd)
             self.ready = self.failed = True
-            try:
-                waiter = self.hub._waiters.popleft()
-            except IndexError:
-                pass
-            else:
-                self.hub.add(*waiter)
             raise
         else:
+            if val:
+                return self.hub.remove(self.fd)
             self.hub.add(self.fd, self, WRITE if self.write else (READ | ERR))
 
     def __repr__(self):
@@ -189,7 +179,6 @@ class Hub(object):
         self.on_init = []
         self.on_close = []
         self.on_task = []
-        self._waiters = defaultdict(deque)
 
     def start(self):
         """Called by StartStopComponent at worker startup."""
@@ -226,18 +215,13 @@ class Hub(object):
         return min(max(delay or 0, min_delay), max_delay)
 
     def add(self, fd, callback, flags):
-        d = self.readers if flags & READ else self.writers
-        fno = fileno(fd)
-        if fno in d:
-            self._waiters[fno].append((fd, callback, flags))
+        try:
+            self.poller.register(fd, flags)
+        except ValueError:
+            self._discard(fd)
         else:
-            try:
-                self.poller.register(fd, flags)
-            except ValueError:
-                self._discard(fd)
-            else:
-                d = self.readers if flags & READ else self.writers
-                d[fno] = callback
+            d = self.readers if flags & READ else self.writers
+            d[fileno(fd)] = callback
 
     def remove(self, fd):
         self._unregister(fd)

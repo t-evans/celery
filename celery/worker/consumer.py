@@ -78,6 +78,7 @@ import socket
 import threading
 
 from time import sleep
+from types import GeneratorType as generator
 from Queue import Empty
 
 from kombu.syn import _detect_environment
@@ -476,18 +477,17 @@ class Consumer(object):
                             on_poll_empty()
                         for fileno, event in events or ():
                             try:
-                                r_called = w_called = False
                                 if event & READ:
-                                    readers[fileno](fileno, event)
+                                    cb = readers[fileno]
                                 elif event & WRITE:
-                                    writers[fileno](fileno, event)
-                                if event & ERR:
-                                    on_r = readers.get(fileno)
-                                    if on_r and not r_called:
-                                        on_r(fileno, event)
-                                    on_w = readers.get(fileno)
-                                    if on_w and not w_called:
-                                        on_w(fileno, event)
+                                    cb = writers[fileno]
+                                elif event & WRITE:
+                                    cb = (readers.get(fileno) or
+                                          writers.get(fileno))
+                                if isinstance(cb, generator):
+                                    next(cb, None)
+                                else:
+                                    cb(fileno, event)
                             except (KeyError, Empty):
                                 continue
                             except socket.error:

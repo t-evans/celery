@@ -42,7 +42,7 @@ from celery.utils.timer2 import Schedule
 from . import bootsteps
 from . import state
 from .buckets import TaskBucket, AsyncTaskBucket, FastQueue
-from .hub import Hub, BoundedSemaphore
+from .hub import Hub, BoundedSemaphore, WRITE
 
 #: Worker states
 RUN = 0x1
@@ -167,24 +167,42 @@ class Pool(bootsteps.StartStopComponent):
         send_offset = pool._pool._inqueue._writer.send_offset
         dumps = _pickle.dumps
 
-        def send_obj(obj):
-            body = dumps(obj, protocol=pickle_protocol)
-            body_size = len(body)
-            header = pack('>I', body_size)
-            body = header + body
-            body_size = len(body)
-            buf = buffer(body)
-            written = 0
-            while written < body_size:
-                try:
-                    written += send_offset(buf, written)
-                except Exception, exc:
-                    if get_errno(exc) not in (errno.EAGAIN, errno.EINTR):
-                        raise
-                    yield
+        from collections import deque
+        messages = deque()
+
+        def _writer():
+            while 1:
+                while messages:
+                    obj = messages.popleft()
+                    body = dumps(obj, protocol=pickle_protocol)
+                    body_size = len(body)
+                    header = pack('>I', body_size)
+                    buf = buffer(body)
+                    Hw = Bw = 0
+                    while Hw < 4:
+                        try:
+                            Hw += send_offset(header, Hw)
+                        except Exception, exc:
+                            if get_errno(exc) not in (errno.EAGAIN, errno.EINTR):
+                                raise
+                        hub.add(inqueue, writer, WRITE)
+                        yield
+                    while Bw < body_size:
+                        try:
+                            Bw += send_offset(buf, Bw)
+                        except Exception, exc:
+                            if get_errno(exc) not in (errno.EAGAIN, errno.EINTR):
+                                raise
+                            hub.add(inqueue, writer, WRITE)
+                            yield
+                hub.remove(inqueue)
+                yield
+
+        writer = _writer()
 
         def quick_put(obj):
-            return hub.when_writable(inqueue, send_obj(obj))
+            messages.append(obj)
+            return hub.add(inqueue, writer, WRITE)
         pool._pool._quick_put = quick_put
 
         def on_process_up(w):
