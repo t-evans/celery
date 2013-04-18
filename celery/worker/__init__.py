@@ -12,6 +12,7 @@
 from __future__ import absolute_import
 
 import atexit
+import errno
 import logging
 import socket
 import sys
@@ -19,10 +20,13 @@ import time
 import traceback
 
 from functools import partial
+from struct import pack
 
 from billiard.exceptions import WorkerLostError
 from billiard.util import Finalize
+from kombu.serialization import pickle as _pickle, pickle_protocol
 from kombu.syn import detect_environment
+from kombu.utils.compat import get_errno
 
 from celery import concurrency as _concurrency
 from celery import platforms
@@ -154,19 +158,44 @@ class Pool(bootsteps.StartStopComponent):
         # able to use the pure-python version of multiprocessing
         # (celery 3.1+)
         try:
-            import _billiard
+            import _billiard  # noqa
         except ImportError:
             # billiard C extension not installed
-            if worker.maxtasksperchild:
+            if w.max_tasks_per_child:
                 logger.warning(MAXTASKS_NO_BILLIARD)
-        _quick_put = pool._pool._quick_put
+        inqueue = pool._pool._inqueue._writer
+        send_offset = pool._pool._inqueue._writer.send_offset
+        dumps = _pickle.dumps
+
+        def send_obj(obj):
+            body = dumps(obj, protocol=pickle_protocol)
+            body_size = len(body)
+            header = pack('>I', body_size)
+            body = header + body
+            body_size = len(body)
+            buf = buffer(body)
+            written = 0
+            while written < body_size:
+                try:
+                    written += send_offset(buf, written)
+                except Exception, exc:
+                    if get_errno(exc) not in (errno.EAGAIN, errno.EINTR):
+                        raise
+                    yield
+
         def quick_put(obj):
-            _quick_put(obj, hub.maintain_pool)
+            return hub.when_writable(inqueue, send_obj(obj))
         pool._pool._quick_put = quick_put
 
+        def on_process_up(w):
+            add_reader(w.sentinel, maintain_pool)
+
+        def on_process_down(w):
+            remove(w.sentinel)
+
         pool.init_callbacks(
-            on_process_up=lambda w: add_reader(w.sentinel, maintain_pool),
-            on_process_down=lambda w: remove(w.sentinel),
+            on_process_up=on_process_up,
+            on_process_down=on_process_down,
             on_timeout_set=on_timeout_set,
             on_timeout_cancel=on_timeout_cancel,
         )
@@ -337,6 +366,7 @@ class WorkController(configurated):
 
     _state = None
     _running = 0
+    pool = None  # set by Pool bootstep, but expected by API.
 
     def __init__(self, loglevel=None, hostname=None, ready_callback=noop,
                  queues=None, app=None, pidfile=None, use_eventloop=None,

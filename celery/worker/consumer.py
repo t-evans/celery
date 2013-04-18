@@ -476,16 +476,18 @@ class Consumer(object):
                             on_poll_empty()
                         for fileno, event in events or ():
                             try:
+                                r_called = w_called = False
                                 if event & READ:
                                     readers[fileno](fileno, event)
-                                if event & WRITE:
+                                elif event & WRITE:
                                     writers[fileno](fileno, event)
                                 if event & ERR:
-                                    for handlermap in readers, writers:
-                                        try:
-                                            handlermap[fileno](fileno, event)
-                                        except KeyError:
-                                            pass
+                                    on_r = readers.get(fileno)
+                                    if on_r and not r_called:
+                                        on_r(fileno, event)
+                                    on_w = readers.get(fileno)
+                                    if on_w and not w_called:
+                                        on_w(fileno, event)
                             except (KeyError, Empty):
                                 continue
                             except socket.error:

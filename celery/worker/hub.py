@@ -11,11 +11,26 @@ from __future__ import absolute_import
 from kombu.utils import cached_property
 from kombu.utils import eventio
 
+from collections import defaultdict, deque
+
+from celery.platforms import fileno
 from celery.utils.log import get_logger
 from celery.utils.timer2 import Schedule
 
 logger = get_logger(__name__)
 READ, WRITE, ERR = eventio.READ, eventio.WRITE, eventio.ERR
+
+
+def repr_flag(flag):
+    return '%s%s%s' % ('R' if flag & READ else '',
+                       'W' if flag & WRITE else '',
+                       '!' if flag & ERR else '')
+
+
+def _rcb(obj):
+    if isinstance(obj, trampoline):
+        return repr(obj)
+    return obj.__name__
 
 
 class BoundedSemaphore(object):
@@ -31,7 +46,7 @@ class BoundedSemaphore(object):
         >>> x = BoundedSemaphore(2)
 
         >>> def callback(i):
-        ...     print('HELLO %r' % i)
+        ...     say('HELLO %r' % (i, ))
 
         >>> x.acquire(callback, 1)
         HELLO 1
@@ -97,6 +112,48 @@ class BoundedSemaphore(object):
         self.value = self.initial_value
 
 
+class trampoline(object):
+
+    def __init__(self, hub, fd, it, write=False):
+        self.hub = hub
+        self.fd = fd
+        self.it = it
+        self.write = write
+        self.ready = self.failed = False
+        self.__name__ = it.__name__
+
+        hub.add(fd, self, WRITE if write else (READ | ERR))
+
+    def __call__(self, fd=None, event=None):
+        try:
+            next(self.it)
+        except StopIteration:
+            self.hub.remove(self.fd)
+            self.ready = True
+            try:
+                waiter = self.hub._waiters[fileno(self.fd)].popleft()
+            except IndexError:
+                pass
+            else:
+                self.hub.add(*waiter)
+        except BaseException:
+            self.hub.remove(self.fd)
+            self.ready = self.failed = True
+            try:
+                waiter = self.hub._waiters.popleft()
+            except IndexError:
+                pass
+            else:
+                self.hub.add(*waiter)
+            raise
+        else:
+            self.hub.add(self.fd, self, WRITE if self.write else (READ | ERR))
+
+    def __repr__(self):
+        return '&%s(%s)' % (self.__name__,
+                            'ready' if self.ready else 'pending')
+
+
 class Hub(object):
     """Event loop object.
 
@@ -132,6 +189,7 @@ class Hub(object):
         self.on_init = []
         self.on_close = []
         self.on_task = []
+        self._waiters = defaultdict(deque)
 
     def start(self):
         """Called by StartStopComponent at worker startup."""
@@ -144,6 +202,12 @@ class Hub(object):
     def init(self):
         for callback in self.on_init:
             callback(self)
+
+    def _callback_for(self, fd, flag):
+        if flag & READ:
+            return self.readers[fileno(fd)]
+        elif flag & WRITE:
+            return self.writers[fileno(fd)]
 
     def fire_timers(self, min_delay=1, max_delay=10, max_timers=10,
                     propagate=()):
@@ -162,13 +226,31 @@ class Hub(object):
         return min(max(delay or 0, min_delay), max_delay)
 
     def add(self, fd, callback, flags):
-        self.poller.register(fd, flags)
-        if not isinstance(fd, int):
-            fd = fd.fileno()
-        if flags & READ:
-            self.readers[fd] = callback
-        if flags & WRITE:
-            self.writers[fd] = callback
+        d = self.readers if flags & READ else self.writers
+        fno = fileno(fd)
+        if fno in d:
+            self._waiters[fno].append((fd, callback, flags))
+        else:
+            try:
+                self.poller.register(fd, flags)
+            except ValueError:
+                self._discard(fd)
+            else:
+                d = self.readers if flags & READ else self.writers
+                d[fno] = callback
+
+    def remove(self, fd):
+        self._unregister(fd)
+        self._discard(fd)
+
+    def trampoline(self, fd, it, write=False):
+        return trampoline(self, fd, it, write=write)
+
+    def when_readable(self, fd, it):
+        return self.trampoline(fd, it, write=False)
+
+    def when_writable(self, fd, it):
+        return self.trampoline(fd, it, write=True)
 
     def add_reader(self, fd, callback):
         return self.add(fd, callback, READ | ERR)
@@ -188,11 +270,10 @@ class Hub(object):
         except (KeyError, OSError):
             pass
 
-    def remove(self, fd):
-        fileno = fd.fileno() if not isinstance(fd, int) else fd
-        self.readers.pop(fileno, None)
-        self.writers.pop(fileno, None)
-        self._unregister(fd)
+    def _discard(self, fd):
+        fd = fileno(fd)
+        self.readers.pop(fd, None)
+        self.writers.pop(fd, None)
 
     def __enter__(self):
         self.init()
@@ -206,6 +287,22 @@ class Hub(object):
         for callback in self.on_close:
             callback(self)
     __exit__ = close
+
+    def _repr_readers(self):
+        return ['%s->%s->%r' % (_rcb(cb), repr_flag(READ | ERR), fd)
+                for fd, cb in self.readers.items()]
+
+    def _repr_writers(self):
+        return ['%s->%s->%r' % (_rcb(cb), repr_flag(WRITE), fd)
+                for fd, cb in self.writers.items()]
+
+    def repr_active(self):
+        return ', '.join(self._repr_readers() + self._repr_writers())
+
+    def repr_events(self, events):
+        return ', '.join(
+            '%s->%s' % (_rcb(self._callback_for(fd, flags)), repr_flag(flags))
+            for fd, flags in events)
 
     @cached_property
     def scheduler(self):
