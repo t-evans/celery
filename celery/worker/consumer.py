@@ -481,7 +481,7 @@ class Consumer(object):
                                     cb = readers[fileno]
                                 elif event & WRITE:
                                     cb = writers[fileno]
-                                elif event & WRITE:
+                                elif event & ERR:
                                     cb = (readers.get(fileno) or
                                           writers.get(fileno))
                                 if isinstance(cb, generator):
