@@ -423,6 +423,7 @@ class Consumer(object):
             on_task_callbacks = hub.on_task
             keep_draining = connection.transport.nb_keep_draining
             errors = connection.connection_errors
+            hub_add, hub_remove = hub.add, hub.remove
 
             if hb and connection.supports_heartbeats:
                 hub.timer.apply_interval(
@@ -485,7 +486,17 @@ class Consumer(object):
                                     cb = (readers.get(fileno) or
                                           writers.get(fileno))
                                 if isinstance(cb, generator):
-                                    next(cb, None)
+                                    try:
+                                        _flags = next(cb, None)
+                                        if _flags:
+                                            hub_add(fileno, cb, _flags)
+                                        else:
+                                            hub_remove(fileno)
+                                    except StopIteration:
+                                        hub_remove(fileno)
+                                    except Exception:
+                                        hub_remove(fileno)
+                                        raise
                                 else:
                                     cb(fileno, event)
                             except (KeyError, Empty):
@@ -737,6 +748,8 @@ class Consumer(object):
         # They can't be acked anyway, as a delivery tag is specific
         # to the current channel.
         self.ready_queue.clear()
+        if self.pool.outbound_buffer:
+            self.pool.outbound_buffer.clear()
         self.timer.clear()
 
         # Re-establish the broker connection and setup the task consumer.

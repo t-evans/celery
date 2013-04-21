@@ -64,6 +64,7 @@ class BasePool(object):
         self.forking_enable = forking_enable
         self.callbacks_propagate = callbacks_propagate
         self._does_debug = logger.isEnabledFor(logging.DEBUG)
+        self.outbound_buffer = None
 
     def on_start(self):
         pass

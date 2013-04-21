@@ -12,7 +12,6 @@
 from __future__ import absolute_import
 
 import atexit
-import errno
 import logging
 import socket
 import sys
@@ -20,13 +19,10 @@ import time
 import traceback
 
 from functools import partial
-from struct import pack
 
 from billiard.exceptions import WorkerLostError
 from billiard.util import Finalize
-from kombu.serialization import pickle as _pickle, pickle_protocol
 from kombu.syn import detect_environment
-from kombu.utils.compat import get_errno
 
 from celery import concurrency as _concurrency
 from celery import platforms
@@ -42,7 +38,7 @@ from celery.utils.timer2 import Schedule
 from . import bootsteps
 from . import state
 from .buckets import TaskBucket, AsyncTaskBucket, FastQueue
-from .hub import Hub, BoundedSemaphore, WRITE
+from .hub import Hub, BoundedSemaphore
 
 #: Worker states
 RUN = 0x1
@@ -163,47 +159,6 @@ class Pool(bootsteps.StartStopComponent):
             # billiard C extension not installed
             if w.max_tasks_per_child:
                 logger.warning(MAXTASKS_NO_BILLIARD)
-        inqueue = pool._pool._inqueue._writer
-        send_offset = pool._pool._inqueue._writer.send_offset
-        dumps = _pickle.dumps
-
-        from collections import deque
-        messages = deque()
-
-        def _writer():
-            while 1:
-                while messages:
-                    obj = messages.popleft()
-                    body = dumps(obj, protocol=pickle_protocol)
-                    body_size = len(body)
-                    header = pack('>I', body_size)
-                    buf = buffer(body)
-                    Hw = Bw = 0
-                    while Hw < 4:
-                        try:
-                            Hw += send_offset(header, Hw)
-                        except Exception, exc:
-                            if get_errno(exc) not in (errno.EAGAIN, errno.EINTR):
-                                raise
-                        hub.add(inqueue, writer, WRITE)
-                        yield
-                    while Bw < body_size:
-                        try:
-                            Bw += send_offset(buf, Bw)
-                        except Exception, exc:
-                            if get_errno(exc) not in (errno.EAGAIN, errno.EINTR):
-                                raise
-                            hub.add(inqueue, writer, WRITE)
-                            yield
-                hub.remove(inqueue)
-                yield
-
-        writer = _writer()
-
-        def quick_put(obj):
-            messages.append(obj)
-            return hub.add(inqueue, writer, WRITE)
-        pool._pool._quick_put = quick_put
 
         def on_process_up(w):
             add_reader(w.sentinel, maintain_pool)
@@ -212,6 +167,7 @@ class Pool(bootsteps.StartStopComponent):
             remove(w.sentinel)
 
         pool.init_callbacks(
+            hub,
             on_process_up=on_process_up,
             on_process_down=on_process_down,
             on_timeout_set=on_timeout_set,
