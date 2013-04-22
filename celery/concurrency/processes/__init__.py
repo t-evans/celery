@@ -28,6 +28,7 @@ from celery import signals
 from celery._state import set_default_app
 from celery.concurrency.base import BasePool
 from celery.task import trace
+from celery.utils.log import get_logger
 
 from celery.worker.hub import WRITE
 
@@ -42,6 +43,13 @@ WORKER_SIGRESET = frozenset(['SIGTERM',
 WORKER_SIGIGNORE = frozenset(['SIGINT'])
 
 UNAVAIL = frozenset([errno.EAGAIN, errno.EINTR])
+
+MAXTASKS_NO_BILLIARD = """\
+maxtasksperchild enabled but billiard C extension not installed!
+This may lead to a deadlock, please install the billiard C extension.
+"""
+
+logger = get_logger(__name__)
 
 
 def process_initializer(app, hostname):
@@ -85,6 +93,14 @@ class TaskPool(BasePool):
         Will pre-fork all workers so they're ready to accept tasks.
 
         """
+        if self.options.get('maxtasksperchild'):
+            try:
+                import _billiard  # noqa
+                _billiard.Connection.send_offset
+            except (ImportError, AttributeError):
+                # billiard C extension not installed
+                logger.warning(MAXTASKS_NO_BILLIARD)
+
         forking_enable(self.forking_enable)
         P = self._pool = self.Pool(processes=self.limit,
                                    initializer=process_initializer,

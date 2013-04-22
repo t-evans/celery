@@ -56,15 +56,17 @@ class BasePool(object):
     #: only used by multiprocessing pool
     uses_semaphore = False
 
-    def __init__(self, limit=None, putlocks=True,
-                 forking_enable=True, callbacks_propagate=(), **options):
+    #: optional outbound buffer (cleared at broker reconnect)
+    outbound_buffer = None
+
+    def __init__(self, limit=None, putlocks=True, forking_enable=True,
+                 callbacks_propagate=(), **options):
         self.limit = limit
         self.putlocks = putlocks
         self.options = options
         self.forking_enable = forking_enable
         self.callbacks_propagate = callbacks_propagate
         self._does_debug = logger.isEnabledFor(logging.DEBUG)
-        self.outbound_buffer = None
 
     def on_start(self):
         pass

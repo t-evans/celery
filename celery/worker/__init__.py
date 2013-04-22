@@ -48,11 +48,6 @@ TERMINATE = 0x3
 #: Default socket timeout at shutdown.
 SHUTDOWN_SOCKET_TIMEOUT = 5.0
 
-MAXTASKS_NO_BILLIARD = """\
-maxtasksperchild enabled but billiard C extension not installed!
-This may lead to a deadlock, please install the billiard C extension.
-"""
-
 logger = get_logger(__name__)
 
 
@@ -144,21 +139,6 @@ class Pool(bootsteps.StartStopComponent):
                 delattr(result, '_tref')
             except AttributeError:
                 pass
-
-        # This makes sure the timers are fired even if writing
-        # to the pool inqueue blocks.
-        # XXX Ugly hack to fix #1306 and the worker will still be blocking
-        # but at least it will recover if there are no worker processes
-        # to write to.
-        # This can be fixed properly when we are
-        # able to use the pure-python version of multiprocessing
-        # (celery 3.1+)
-        try:
-            import _billiard  # noqa
-        except ImportError:
-            # billiard C extension not installed
-            if w.max_tasks_per_child:
-                logger.warning(MAXTASKS_NO_BILLIARD)
 
         def on_process_up(w):
             add_reader(w.sentinel, maintain_pool)
