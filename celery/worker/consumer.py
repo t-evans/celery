@@ -396,6 +396,10 @@ class Consumer(object):
                 self.consume_messages()
             except self.connection_errors + self.channel_errors:
                 error(RETRY_CONNECTION, exc_info=True)
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
 
     def on_poll_init(self, hub):
         hub.update_readers(self.connection.eventmap)
