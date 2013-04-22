@@ -43,7 +43,7 @@ def revoke(panel, task_id, terminate=False, signal=None, **kwargs):
     revoked.add(task_id)
     if terminate:
         signum = _signals.signum(signal or 'TERM')
-        for request in state.active_requests:
+        for request in state.reserved_requests:
             if request.id == task_id:
                 logger.info('Terminating %s (%s)', task_id, signum)
                 request.terminate(panel.consumer.pool, signal=signum)
