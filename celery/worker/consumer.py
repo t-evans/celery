@@ -750,6 +750,8 @@ class Consumer(object):
         self.ready_queue.clear()
         if self.pool.outbound_buffer:
             self.pool.outbound_buffer.clear()
+        if self.controller.semaphore:
+            self.controller.semaphore.clear()
         self.timer.clear()
 
         # Re-establish the broker connection and setup the task consumer.
