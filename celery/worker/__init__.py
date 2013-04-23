@@ -114,7 +114,7 @@ class Pool(bootsteps.StartStopComponent):
 
         # need to handle pool results before every task
         # since multiple tasks can be received in a single poll()
-        hub.on_task.append(pool.maybe_handle_result)
+        #hub.on_task.append(pool.maybe_handle_result)
 
         hub.update_readers(pool.readers)
         for handler, interval in pool.timers.iteritems():

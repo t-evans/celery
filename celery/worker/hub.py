@@ -12,6 +12,7 @@ from kombu.utils import cached_property
 from kombu.utils import eventio
 
 from celery.platforms import fileno
+from celery.utils.functional import maybe_list
 from celery.utils.log import get_logger
 from celery.utils.timer2 import Schedule
 
@@ -185,25 +186,26 @@ class Hub(object):
                     logger.error('Error in timer: %r', exc, exc_info=1)
         return min(max(delay or 0, min_delay), max_delay)
 
-    def add(self, fd, callback, flags):
-        try:
-            self.poller.register(fd, flags)
-        except ValueError:
-            self._discard(fd)
-        else:
-            d = self.readers if flags & READ else self.writers
-            d[fileno(fd)] = callback
+    def add(self, fds, callback, flags):
+        for fd in maybe_list(fds):
+            try:
+                self.poller.register(fd, flags)
+            except ValueError:
+                self._discard(fd)
+            else:
+                d = self.readers if flags & READ else self.writers
+                d[fileno(fd)] = callback
 
     def remove(self, fd):
         fd = fileno(fd)
         self._unregister(fd)
         self._discard(fd)
 
-    def add_reader(self, fd, callback):
-        return self.add(fd, callback, READ | ERR)
+    def add_reader(self, fds, callback):
+        return self.add(fds, callback, READ | ERR)
 
-    def add_writer(self, fd, callback):
-        return self.add(fd, callback, WRITE)
+    def add_writer(self, fds, callback):
+        return self.add(fds, callback, WRITE)
 
     def update_readers(self, readers):
         [self.add_reader(*x) for x in readers.iteritems()]

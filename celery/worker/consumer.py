@@ -491,9 +491,11 @@ class Consumer(object):
                                           writers.get(fileno))
                                 if isinstance(cb, generator):
                                     try:
-                                        _flags = next(cb, None)
-                                        if _flags:
-                                            hub_add(fileno, cb, _flags)
+                                        _coret = cb.send(fileno)
+                                        if _coret:
+                                            print('CORET: %r' % (_coret, ))
+                                            _filenos, ncb, _flags = _coret
+                                            hub_add(_filenos, ncb or cb, _flags)
                                         else:
                                             hub_remove(fileno)
                                     except StopIteration:

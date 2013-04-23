@@ -155,16 +155,59 @@ class TaskPool(BasePool):
         protocol = HIGHEST_PROTOCOL
         pack = struct.pack
         dumps = _pickle.dumps
-        inqueue_w = self._inqueue_w
-        writer = self._inqueue_writer(hub)
-        put_message = self.outbound_buffer.append
+        outbound = self.outbound_buffer
+        pop_message = outbound.popleft
+        put_message = outbound.append
+        fileno_to_inq = self._pool._fileno_to_inq
+
+        def _write_to(fileno, header, body, body_size):
+            yield  # not a coroutine, needs to be started
+            print('WRITE TO %r' % (fileno, ))
+            try:
+                fh = fileno_to_inq[fileno]
+            except KeyError:
+                put_message((header, body, body_size))
+            send_offset = fh.inq._writer.send_offset
+
+            Hw = Bw = 0
+            while Hw < 4:
+                try:
+                    Hw += send_offset(header, Hw)
+                except Exception, exc:
+                    if get_errno(exc) not in UNAVAIL:
+                        raise
+                    # suspend until more data
+                    yield (fileno, ), None, WRITE
+            while Bw < body_size:
+                try:
+                    Bw += send_offset(body, Bw)
+                except Exception, exc:
+                    if get_errno(exc) not in UNAVAIL:
+                        raise
+                    # suspend until more data
+                    yield (fileno, ), None, WRITE
+
+        def _inqueue_writer(hub, get_errno=get_errno):
+            while 1:
+                fileno = yield
+                try:
+                    header, body, body_size = pop_message()
+                except IndexError:
+                    yield  # no more messages -- remove from evloop
+                else:
+                    cor = _write_to(fileno, header, body, body_size)
+                    next(cor)
+                    yield (fileno, ), cor, WRITE
+
+        writer = _inqueue_writer(hub)
+        next(writer)
 
         def quick_put(obj):
             body = dumps(obj, protocol=protocol)
             body_size = len(body)
             header = pack('>I', body_size)
             put_message((header, buffer(body), body_size))
-            return hub.add(inqueue_w.fileno(), writer, hub.WRITE)
+            return hub.add(fileno_to_inq.keys(), writer, hub.WRITE)
         self._pool._quick_put = quick_put
 
         for k, v in kwargs.iteritems():
@@ -173,33 +216,6 @@ class TaskPool(BasePool):
     def handle_timeouts(self):
         if self._pool._timeout_handler:
             self._pool._timeout_handler.handle_event()
-
-    def _inqueue_writer(self, hub, get_errno=get_errno):
-        outbound = self.outbound_buffer
-        pop = outbound.popleft
-        send_offset = self._inqueue_w.send_offset
-
-        while 1:
-            while outbound:
-                header, body, body_size = pop()
-                Hw = Bw = 0
-                while Hw < 4:
-                    try:
-                        Hw += send_offset(header, Hw)
-                    except Exception, exc:
-                        if get_errno(exc) not in UNAVAIL:
-                            raise
-                        # suspend until more data
-                        yield WRITE
-                while Bw < body_size:
-                    try:
-                        Bw += send_offset(body, Bw)
-                    except Exception, exc:
-                        if get_errno(exc) not in UNAVAIL:
-                            raise
-                        # suspend until more data
-                        yield WRITE
-            yield  # removes itself from evloop
 
     @property
     def num_processes(self):
