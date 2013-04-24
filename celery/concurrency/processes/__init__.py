@@ -28,6 +28,7 @@ from celery import signals
 from celery._state import set_default_app
 from celery.concurrency.base import BasePool
 from celery.task import trace
+from celery.platforms import fileno
 from celery.utils.log import get_logger
 
 from celery.worker.hub import WRITE
@@ -111,6 +112,9 @@ class TaskPool(BasePool):
         self.maintain_pool = P.maintain_pool
         self.maybe_handle_result = P._result_handler.handle_event
         self.outbound_buffer = deque()
+        self.handle_result_event = P.handle_result_event
+        self._all_inqueues = set(fileno(p.inq._writer) for p in P._pool)
+        self._active_writes = set()
 
     def did_start_ok(self):
         return self._pool.did_start_ok()
@@ -159,59 +163,72 @@ class TaskPool(BasePool):
         pop_message = outbound.popleft
         put_message = outbound.append
         fileno_to_inq = self._pool._fileno_to_inq
+        all_inqueues = self._all_inqueues
+        active_writes = self._active_writes
+        remove_coro = hub.coros.pop
+        add_coro = hub.add_coro
+        diff = all_inqueues.difference
+        hub_add = hub.add
+        inq_exists = fileno_to_inq.__contains__
+        for k, v in kwargs.iteritems():
+            setattr(self._pool, k, v)
 
-        def _write_to(fileno, header, body, body_size):
-            yield  # not a coroutine, needs to be started
-            print('WRITE TO %r' % (fileno, ))
+        def _write_to(fd, header, body, body_size):
             try:
-                fh = fileno_to_inq[fileno]
-            except KeyError:
-                put_message((header, body, body_size))
-            send_offset = fh.inq._writer.send_offset
-
-            Hw = Bw = 0
-            while Hw < 4:
                 try:
-                    Hw += send_offset(header, Hw)
-                except Exception, exc:
-                    if get_errno(exc) not in UNAVAIL:
-                        raise
-                    # suspend until more data
-                    yield (fileno, ), None, WRITE
-            while Bw < body_size:
-                try:
-                    Bw += send_offset(body, Bw)
-                except Exception, exc:
-                    if get_errno(exc) not in UNAVAIL:
-                        raise
-                    # suspend until more data
-                    yield (fileno, ), None, WRITE
+                    proc = fileno_to_inq[fd]
+                except KeyError:
+                    put_message((header, body, body_size))
+                    raise StopIteration()
+                if proc.exitcode is not None:
+                    put_message((header, body, body_size))
+                    raise StopIteration()
+                send_offset = proc.inq._writer.send_offset
+                import os
+                os.kill(proc.pid, 0)
 
-        def _inqueue_writer(hub, get_errno=get_errno):
-            while 1:
-                fileno = yield
-                try:
-                    header, body, body_size = pop_message()
-                except IndexError:
-                    yield  # no more messages -- remove from evloop
-                else:
-                    cor = _write_to(fileno, header, body, body_size)
-                    next(cor)
-                    yield (fileno, ), cor, WRITE
+                Hw = Bw = 0
+                while Hw < 4:
+                    try:
+                        Hw += send_offset(header, Hw)
+                    except Exception, exc:
+                        if get_errno(exc) not in UNAVAIL:
+                            raise
+                        # suspend until more data
+                        yield
+                while Bw < body_size:
+                    try:
+                        Bw += send_offset(body, Bw)
+                    except Exception, exc:
+                        if get_errno(exc) not in UNAVAIL:
+                            raise
+                        # suspend until more data
+                        yield
+            finally:
+                active_writes.discard(fd)
 
-        writer = _inqueue_writer(hub)
-        next(writer)
+        def schedule_writes(ready_fd, events):
+            try:
+                header, body, body_size = pop_message()
+            except IndexError:
+                for inqfd in diff(active_writes):
+                    hub.remove(inqfd)
+            else:
+                active_writes.add(ready_fd)
+                cor = _write_to(ready_fd, header, body, body_size)
+                add_coro((ready_fd, ), cor, WRITE)
+
+        def on_poll_start(hub):
+            if outbound:
+                hub_add(diff(active_writes), schedule_writes, hub.WRITE)
+        self.on_poll_start = on_poll_start
 
         def quick_put(obj):
             body = dumps(obj, protocol=protocol)
             body_size = len(body)
             header = pack('>I', body_size)
             put_message((header, buffer(body), body_size))
-            return hub.add(fileno_to_inq.keys(), writer, hub.WRITE)
         self._pool._quick_put = quick_put
-
-        for k, v in kwargs.iteritems():
-            setattr(self._pool, k, v)
 
     def handle_timeouts(self):
         if self._pool._timeout_handler:

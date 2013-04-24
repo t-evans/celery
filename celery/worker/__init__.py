@@ -29,6 +29,7 @@ from celery import platforms
 from celery.app import app_or_default
 from celery.app.abstract import configurated, from_config
 from celery.exceptions import SystemTerminate, TaskRevokedError
+from celery.platforms import fileno
 from celery.utils.functional import noop
 from celery.utils.imports import qualname, reload_from_cwd
 from celery.utils.log import get_logger
@@ -140,11 +141,15 @@ class Pool(bootsteps.StartStopComponent):
             except AttributeError:
                 pass
 
-        def on_process_up(w):
-            add_reader(w.sentinel, maintain_pool)
+        def on_process_up(proc):
+            pool._all_inqueues.add(proc.inq._writer.fileno())
+            add_reader(proc.sentinel, maintain_pool)
+            add_reader(proc.outq._reader.fileno(), pool.handle_result_event)
 
-        def on_process_down(w):
-            remove(w.sentinel)
+        def on_process_down(proc):
+            pool._all_inqueues.discard(proc.inq._writer.fileno())
+            remove(proc.sentinel)
+            remove(proc.outq._reader.fileno())
 
         pool.init_callbacks(
             hub,

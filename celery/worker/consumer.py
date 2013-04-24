@@ -420,8 +420,9 @@ class Consumer(object):
             connection = self.connection
             hb = self.amqheartbeat
             hbtick = connection.heartbeat_check
-            on_poll_start = connection.transport.on_poll_start
-            on_poll_empty = connection.transport.on_poll_empty
+            conn_poll_start = connection.transport.on_poll_start
+            conn_poll_empty = connection.transport.on_poll_empty
+            pool_poll_start = self.pool.on_poll_start
             strategies = self.strategies
             drain_nowait = connection.drain_nowait
             on_task_callbacks = hub.on_task
@@ -470,16 +471,18 @@ class Consumer(object):
                 if qos.prev != qos.value:
                     update_qos()
 
-                update_readers(on_poll_start())
+                update_readers(conn_poll_start())
+                pool_poll_start(hub)
                 if readers or writers:
                     connection.more_to_read = True
                     while connection.more_to_read:
                         try:
                             events = poll(poll_timeout)
+                            #print('EVENTS: %s' % (hub.repr_events(events, )))
                         except ValueError:  # Issue 882
                             return
                         if not events:
-                            on_poll_empty()
+                            conn_poll_empty()
                         for fileno, event in events or ():
                             try:
                                 if event & READ:
@@ -490,19 +493,7 @@ class Consumer(object):
                                     cb = (readers.get(fileno) or
                                           writers.get(fileno))
                                 if isinstance(cb, generator):
-                                    try:
-                                        _coret = cb.send(fileno)
-                                        if _coret:
-                                            print('CORET: %r' % (_coret, ))
-                                            _filenos, ncb, _flags = _coret
-                                            hub_add(_filenos, ncb or cb, _flags)
-                                        else:
-                                            hub_remove(fileno)
-                                    except StopIteration:
-                                        hub_remove(fileno)
-                                    except Exception:
-                                        hub_remove(fileno)
-                                        raise
+                                    cb.send((fileno, event))
                                 else:
                                     cb(fileno, event)
                             except (KeyError, Empty):

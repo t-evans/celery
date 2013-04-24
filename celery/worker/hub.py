@@ -8,6 +8,9 @@
 """
 from __future__ import absolute_import
 
+from collections import defaultdict, deque
+from functools import wraps
+
 from kombu.utils import cached_property
 from kombu.utils import eventio
 
@@ -30,6 +33,17 @@ def _rcb(obj):
     if isinstance(obj, basestring):
         return obj
     return obj.__name__
+
+
+def coroutine(gen):
+
+    @wraps(gen)
+    def advances(*args, **kwargs):
+        it = gen(*args, **kwargs)
+        next(it)
+        return it
+
+    return advances
 
 
 class BoundedSemaphore(object):
@@ -146,6 +160,33 @@ class Hub(object):
         self.on_init = []
         self.on_close = []
         self.on_task = []
+        self.coros = {}
+
+        self.trampoline = self._trampoline()
+
+    @coroutine
+    def _trampoline(self):
+        coros = self.coros
+        add = self.add_coro
+        remove = self.remove_coro
+        remove_self = self.remove
+        pop = self.coros.pop
+        while 1:
+            fd, events = (yield)
+            remove_self(fd)
+            try:
+                gen = coros[fd]
+            except KeyError:
+                pass
+            else:
+                try:
+                    ret = next(gen)
+                    add(fd, gen, WRITE)
+                except StopIteration:
+                    pop(fd, None)
+                except Exception:
+                    pop(fd, None)
+                    raise
 
     def start(self):
         """Called by StartStopComponent at worker startup."""
@@ -186,15 +227,25 @@ class Hub(object):
                     logger.error('Error in timer: %r', exc, exc_info=1)
         return min(max(delay or 0, min_delay), max_delay)
 
-    def add(self, fds, callback, flags):
+    def _add(self, fd, cb, flags):
+        self.poller.register(fd, flags)
+        (self.readers if flags & READ else self.writers)[fileno(fd)] = cb
+
+    def add(self, fds, callback, flags, propagate=False):
         for fd in maybe_list(fds):
             try:
-                self.poller.register(fd, flags)
+                self._add(fd, callback, flags)
             except ValueError:
                 self._discard(fd)
-            else:
-                d = self.readers if flags & READ else self.writers
-                d[fileno(fd)] = callback
+
+    def add_coro(self, fds, coro, flags):
+        for fd in (fileno(f) for f in maybe_list(fds)):
+            self._add(fd, self.trampoline, flags)
+            self.coros[fd] = coro
+
+    def remove_coro(self, fds):
+        for fd in (fileno(f) for f in maybe_list(fds)):
+            self.coros.pop(fd, None)
 
     def remove(self, fd):
         fd = fileno(fd)
