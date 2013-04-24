@@ -110,6 +110,10 @@ class TaskPool(BasePool):
         self.on_soft_timeout = P._timeout_handler.on_soft_timeout
         self.on_hard_timeout = P._timeout_handler.on_hard_timeout
         self.maintain_pool = P.maintain_pool
+        self.terminate_job = self._pool_terminate_job
+        self.grow = self._pool.grow
+        self.shrink = self._pool.shrink
+        self.restart = self._pool.restart
         self.maybe_handle_result = P._result_handler.handle_event
         self.outbound_buffer = deque()
         self.handle_result_event = P.handle_result_event
@@ -135,18 +139,6 @@ class TaskPool(BasePool):
     def on_close(self):
         if self._pool is not None and self._pool._state == RUN:
             self._pool.close()
-
-    def terminate_job(self, pid, signal=None):
-        return self._pool.terminate_job(pid, signal)
-
-    def grow(self, n=1):
-        return self._pool.grow(n)
-
-    def shrink(self, n=1):
-        return self._pool.shrink(n)
-
-    def restart(self):
-        self._pool.restart()
 
     def _get_info(self):
         return {'max-concurrency': self.limit,
@@ -249,7 +241,3 @@ class TaskPool(BasePool):
     @property
     def timers(self):
         return {self.maintain_pool: 5.0}
-
-    @property
-    def _inqueue_w(self):
-        return self._pool._inqueue._writer
