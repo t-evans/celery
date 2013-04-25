@@ -110,7 +110,7 @@ class TaskPool(BasePool):
         self.on_soft_timeout = P._timeout_handler.on_soft_timeout
         self.on_hard_timeout = P._timeout_handler.on_hard_timeout
         self.maintain_pool = P.maintain_pool
-        self.terminate_job = self._pool_terminate_job
+        self.terminate_job = self._pool.terminate_job
         self.grow = self._pool.grow
         self.shrink = self._pool.shrink
         self.restart = self._pool.restart

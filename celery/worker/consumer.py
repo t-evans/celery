@@ -750,6 +750,7 @@ class Consumer(object):
         if self.controller.semaphore:
             self.controller.semaphore.clear()
         self.timer.clear()
+        state.reserved_requests.clear()
 
         # Re-establish the broker connection and setup the task consumer.
         self.connection = self._open_connection()
