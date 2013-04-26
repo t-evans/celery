@@ -8,7 +8,6 @@
 """
 from __future__ import absolute_import
 
-from collections import defaultdict, deque
 from functools import wraps
 
 from kombu.utils import cached_property
@@ -168,7 +167,6 @@ class Hub(object):
     def _trampoline(self):
         coros = self.coros
         add = self.add_coro
-        remove = self.remove_coro
         remove_self = self.remove
         pop = self.coros.pop
         while 1:
@@ -180,7 +178,7 @@ class Hub(object):
                 pass
             else:
                 try:
-                    ret = next(gen)
+                    next(gen)
                     add(fd, gen, WRITE)
                 except StopIteration:
                     pop(fd, None)

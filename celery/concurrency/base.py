@@ -107,6 +107,9 @@ class BasePool(object):
         self.on_stop()
         self._state = self.TERMINATE
 
+    def flush(self):
+        pass
+
     def terminate(self):
         self._state = self.TERMINATE
         self.on_terminate()

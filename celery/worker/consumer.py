@@ -745,12 +745,11 @@ class Consumer(object):
         # They can't be acked anyway, as a delivery tag is specific
         # to the current channel.
         self.ready_queue.clear()
-        if self.pool.outbound_buffer:
-            self.pool.outbound_buffer.clear()
         if self.controller.semaphore:
             self.controller.semaphore.clear()
         self.timer.clear()
         state.reserved_requests.clear()
+        self.pool.flush()
 
         # Re-establish the broker connection and setup the task consumer.
         self.connection = self._open_connection()

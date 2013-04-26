@@ -17,10 +17,13 @@ import struct
 
 from collections import deque
 from pickle import HIGHEST_PROTOCOL
+from time import sleep
 
 from billiard import forking_enable
-from billiard.pool import Pool, RUN, CLOSE
+from billiard.pool import RUN, CLOSE, Pool as _Pool
+from billiard.queues import _SimpleQueue
 from kombu.serialization import pickle as _pickle
+from kombu.utils import fxrange
 from kombu.utils.compat import get_errno
 
 from celery import platforms
@@ -43,7 +46,7 @@ WORKER_SIGRESET = frozenset(['SIGTERM',
 #: List of signals to ignore when a child process starts.
 WORKER_SIGIGNORE = frozenset(['SIGINT'])
 
-UNAVAIL = frozenset([errno.EAGAIN, errno.EINTR])
+UNAVAIL = frozenset([errno.EAGAIN, errno.EINTR, errno.EBADF])
 
 MAXTASKS_NO_BILLIARD = """\
 maxtasksperchild enabled but billiard C extension not installed!
@@ -81,9 +84,84 @@ def process_initializer(app, hostname):
     signals.worker_process_init.send(sender=None)
 
 
+class promise(object):
+
+    def __init__(self, fun, *partial_args, **partial_kwargs):
+        self.fun = fun
+        self.args = partial_args
+        self.kwargs = partial_kwargs
+        self.ready = False
+
+    def __call__(self, *args, **kwargs):
+        try:
+            return self.fun(*tuple(self.args) + tuple(args),
+                            **dict(self.kwargs, **kwargs))
+        finally:
+            self.ready = True
+
+
+class AsynIPCPool(_Pool):
+
+    def __init__(self, processes=None, *args, **kwargs):
+        processes = self.cpu_count() if processes is None else processes
+        self._queuepairs = dict((self.create_process_queuepair(), None)
+                                for _ in range(processes))
+        super(AsynIPCPool, self).__init__(processes, *args, **kwargs)
+
+    def _available_queuepair(self):
+        return next(pair for pair, owner in self._queuepairs.iteritems()
+                    if owner is None)
+    get_process_queuepair = _available_queuepair
+
+    def create_process_queuepair(self):
+        return _SimpleQueue(), _SimpleQueue()
+
+    def _process_cleanup_queuepair(self, proc):
+        try:
+            self._queuepairs[self._find_worker_queuepair(proc)] = None
+        except (KeyError, ValueError):
+            pass
+
+    def _process_register_queuepair(self, proc, pair):
+        self._queuepairs[pair] = proc
+
+    def _find_worker_queuepair(self, proc):
+        for pair, owner in self._queuepairs.iteritems():
+            if owner == proc:
+                return pair
+        raise ValueError(proc)
+
+    def _setup_queues(self):
+        self._inqueue = self._outqueue = \
+            self._quick_put = self._quick_get = self._poll_result = None
+
+    def on_partial_read(self, job, proc):
+        resq = proc.outq._reader
+        # empty result queue buffer
+        while resq.poll(0):
+            self.handle_result_event(resq.fileno())
+
+        # job was not acked, so find another worker to send it to.
+        if not job._accepted:
+            self._put_back(job)
+
+        # worker terminated by signal:
+        # we cannot reuse the sockets again, because we don't know if the
+        # process wrote/read anything from them, and if so we cannot
+        # restore the message boundaries.
+        if proc.exitcode < 0:
+            print('JOB %r WRITTEN TO TERMINATED WORKER: %r' % (job, proc))
+            for conn in (proc.inq, proc.outq):
+                for sock in (conn._reader, conn._writer):
+                    if not sock.closed:
+                        os.close(sock.fileno())
+            self._queuepairs[(proc.inq, proc.outq)] = \
+                self._queuepairs[self.create_process_queuepair()] = None
+
+
 class TaskPool(BasePool):
     """Multiprocessing Pool implementation."""
-    Pool = Pool
+    Pool = AsynIPCPool
 
     requires_mediator = True
     uses_semaphore = True
@@ -119,6 +197,7 @@ class TaskPool(BasePool):
         self.handle_result_event = P.handle_result_event
         self._all_inqueues = set(fileno(p.inq._writer) for p in P._pool)
         self._active_writes = set()
+        self._active_writers = set()
 
     def did_start_ok(self):
         return self._pool.did_start_ok()
@@ -157,27 +236,29 @@ class TaskPool(BasePool):
         fileno_to_inq = self._pool._fileno_to_inq
         all_inqueues = self._all_inqueues
         active_writes = self._active_writes
-        remove_coro = hub.coros.pop
         add_coro = hub.add_coro
         diff = all_inqueues.difference
         hub_add = hub.add
-        inq_exists = fileno_to_inq.__contains__
+        mark_write_fd_as_active = active_writes.add
+        mark_write_gen_as_active = self._active_writers.add
+        write_generator_gone = self._active_writers.discard
+        get_job = self._pool._cache.__getitem__
+        self._pool._put_back = put_message
+
         for k, v in kwargs.iteritems():
             setattr(self._pool, k, v)
 
-        def _write_to(fd, header, body, body_size):
+        def _write_to(fd, job, callback=None):
+            header, body, body_size = job._payload
             try:
                 try:
                     proc = fileno_to_inq[fd]
                 except KeyError:
-                    put_message((header, body, body_size))
-                    raise StopIteration()
-                if proc.exitcode is not None:
-                    put_message((header, body, body_size))
+                    put_message(job)
                     raise StopIteration()
                 send_offset = proc.inq._writer.send_offset
-                import os
-                os.kill(proc.pid, 0)
+                # job result keeps track of what process the job is sent to.
+                job._write_to = proc
 
                 Hw = Bw = 0
                 while Hw < 4:
@@ -197,17 +278,22 @@ class TaskPool(BasePool):
                         # suspend until more data
                         yield
             finally:
+                if callback:
+                    callback()
                 active_writes.discard(fd)
 
         def schedule_writes(ready_fd, events):
             try:
-                header, body, body_size = pop_message()
+                job = pop_message()
             except IndexError:
                 for inqfd in diff(active_writes):
                     hub.remove(inqfd)
             else:
-                active_writes.add(ready_fd)
-                cor = _write_to(ready_fd, header, body, body_size)
+                callback = promise(write_generator_gone)
+                cor = _write_to(ready_fd, job, callback=callback)
+                mark_write_gen_as_active(cor)
+                mark_write_fd_as_active(ready_fd)
+                callback.args = (cor, )  # tricky as we need to pass ref
                 add_coro((ready_fd, ), cor, WRITE)
 
         def on_poll_start(hub):
@@ -215,16 +301,42 @@ class TaskPool(BasePool):
                 hub_add(diff(active_writes), schedule_writes, hub.WRITE)
         self.on_poll_start = on_poll_start
 
-        def quick_put(obj):
-            body = dumps(obj, protocol=protocol)
+        def quick_put(tup):
+            body = dumps(tup, protocol=protocol)
             body_size = len(body)
             header = pack('>I', body_size)
-            put_message((header, buffer(body), body_size))
+            # index 0 is the job ID.
+            job = get_job(tup[0])
+            job._payload = header, buffer(body), body_size
+            put_message(job)
         self._pool._quick_put = quick_put
 
     def handle_timeouts(self):
         if self._pool._timeout_handler:
             self._pool._timeout_handler.handle_event()
+
+    def flush(self):
+        if self.outbound_buffer:
+            self.outbound_buffer.clear()
+        try:
+            # FLUSH OUTGOING BUFFERS
+            intervals = fxrange(0.01, 0.1, 0.01, repeatlast=True)
+            while self._active_writers:
+                writers = list(self._active_writers)
+                for gen in writers:
+                    if gen.gi_frame.f_lasti != -1:  # generator started?
+                        try:
+                            next(gen)
+                        except StopIteration:
+                            self._active_writers.discard(gen)
+                # workers may have exited in the meantime.
+                # FIXME If a worker is terminated it could've been terminated
+                # after having read partial data.
+                self.maintain_pool()
+                sleep(next(intervals))  # don't busyloop
+        finally:
+            self.outbound_buffer.clear()
+            self._active_writers.clear()
 
     @property
     def num_processes(self):
