@@ -13,6 +13,8 @@ from __future__ import absolute_import
 
 import errno
 import os
+import select
+import socket
 import struct
 
 from collections import deque
@@ -20,11 +22,13 @@ from pickle import HIGHEST_PROTOCOL
 from time import sleep
 
 from billiard import forking_enable
-from billiard.pool import RUN, CLOSE, Pool as _Pool
+from billiard import pool as _pool
+from billiard.pool import RUN, CLOSE, TERMINATE, WorkersJoined
 from billiard.queues import _SimpleQueue
 from kombu.serialization import pickle as _pickle
 from kombu.utils import fxrange
 from kombu.utils.compat import get_errno
+from kombu.utils.eventio import SELECT_BAD_FD
 
 from celery import platforms
 from celery import signals
@@ -54,6 +58,31 @@ This may lead to a deadlock, please install the billiard C extension.
 """
 
 logger = get_logger(__name__)
+
+
+def _select(self, readers=None, writers=None, err=None, timeout=0):
+    readers = set() if readers is None else readers
+    writers = set() if writers is None else writers
+    err = set() if err is None else err
+    try:
+        r, w, e = select.select(readers, writers, err, timeout)
+        if e:
+            _seen = set()
+            r = [f for f in r + e if f not in _seen and not _seen.add(f)]
+        return r, w, 0
+    except (select.error, socket.error), exc:
+        if get_errno(exc) == errno.EINTR:
+            return
+        elif get_errno(exc) in SELECT_BAD_FD:
+            for fd in readers | writers | err:
+                try:
+                    select.select([fd], [], [], 0)
+                except (select.error, socket.error), exc:
+                    if get_errno(exc) in SELECT_BAD_FD:
+                        readers.discard(fd)
+                        writers.discard(fd)
+                        err.discard(fd)
+            return [], [], 1
 
 
 def process_initializer(app, hostname):
@@ -100,7 +129,45 @@ class promise(object):
             self.ready = True
 
 
-class AsynIPCPool(_Pool):
+class ResultHandler(_pool.ResultHandler):
+
+    def on_stop_not_started(self):
+        cache = self.cache
+        check_timeouts = self.check_timeouts
+        fileno_to_proc = self.fileno_to_proc
+        on_state_change = self.on_state_change
+        join_exited_workers = self.join_exited_workers
+
+        outqueues = set(fileno_to_proc)
+        while cache and outqueues and self._state != TERMINATE:
+            if check_timeouts is not None:
+                check_timeouts()
+            for fd in outqueues:
+                proc = fileno_to_proc[fd]
+                reader = proc.outq._reader
+                try:
+                    if reader.poll(0):
+                        task = reader.recv()
+                    else:
+                        task = None
+                        sleep(0.5)
+                except (IOError, EOFError):
+                    outqueues.discard(fd)
+                    continue
+                else:
+                    if task is None:
+                        _pool.debug('result handler ignoring extra sentinel')
+                        continue
+                    on_state_change(task)
+                try:
+                    join_exited_workers(shutdown=True)
+                except WorkersJoined:
+                    _pool.debug('result handler: all workers terminated')
+                    return
+
+
+class AsynIPCPool(_pool.Pool):
+    ResultHandler = ResultHandler
 
     def __init__(self, processes=None, *args, **kwargs):
         processes = self.cpu_count() if processes is None else processes
@@ -121,6 +188,12 @@ class AsynIPCPool(_Pool):
             self._queuepairs[self._find_worker_queuepair(proc)] = None
         except (KeyError, ValueError):
             pass
+
+    @staticmethod
+    def _stop_task_handler(task_handler):
+        for worker in task_handler.pool:
+            # send sentinels
+            worker.inq.put(None)
 
     def _process_register_queuepair(self, proc, pair):
         self._queuepairs[pair] = proc
@@ -150,7 +223,6 @@ class AsynIPCPool(_Pool):
         # process wrote/read anything from them, and if so we cannot
         # restore the message boundaries.
         if proc.exitcode < 0:
-            print('JOB %r WRITTEN TO TERMINATED WORKER: %r' % (job, proc))
             for conn in (proc.inq, proc.outq):
                 for sock in (conn._reader, conn._writer):
                     if not sock.closed:
@@ -158,10 +230,32 @@ class AsynIPCPool(_Pool):
             self._queuepairs[(proc.inq, proc.outq)] = \
                 self._queuepairs[self.create_process_queuepair()] = None
 
+    @classmethod
+    def _set_result_sentinel(cls, _outqueue, workers):
+        for worker in workers:
+            worker.outqueue.put(None)
+
+    @classmethod
+    def _help_stuff_finish(cls, _inqueue, _taskhandler, _size, fileno_to_inq):
+        # task_handler may be blocked trying to put items on inqueue
+        _pool.debug(
+            'removing tasks from inqueue until task handler finished',
+        )
+        inqueues = set(fileno_to_inq)
+        while inqueues:
+            readable, _, again = _select(inqueues, timeout=0.5)
+            if again:
+                continue
+            if not readable:
+                break
+            for fd in readable:
+                fileno_to_inq[fd]._reader.recv()
+            sleep(0)
+
 
 class TaskPool(BasePool):
     """Multiprocessing Pool implementation."""
-    Pool = AsynIPCPool
+    Pool = _pool.Pool
 
     requires_mediator = True
     uses_semaphore = True
@@ -181,9 +275,10 @@ class TaskPool(BasePool):
                 logger.warning(MAXTASKS_NO_BILLIARD)
 
         forking_enable(self.forking_enable)
-        P = self._pool = self.Pool(processes=self.limit,
-                                   initializer=process_initializer,
-                                   **self.options)
+        Pool = self.Pool if self.options.get('threads', True) else AsynIPCPool
+        P = self._pool = Pool(processes=self.limit,
+                              initializer=process_initializer,
+                              **self.options)
         self.on_apply = P.apply_async
         self.on_soft_timeout = P._timeout_handler.on_soft_timeout
         self.on_hard_timeout = P._timeout_handler.on_hard_timeout
