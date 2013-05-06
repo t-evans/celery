@@ -693,6 +693,10 @@ class Task(object):
         """
         if task_id is None:
             task_id = self.request.id
+        if state == states.PENDING:
+            current_state = self.state;
+            if current_state != states.PENDING:
+                raise Exception('Something tried to turn the task state back to pending')
         self.backend.store_result(task_id, meta, state)
 
     def on_success(self, retval, task_id, args, kwargs):
